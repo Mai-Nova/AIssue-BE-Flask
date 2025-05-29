@@ -28,7 +28,7 @@ class Config:
     CHUNK_OVERLAP = 400  # RecursiveCharacterTextSplitter 청크 오버랩 (문서 분할 시)
     EMBEDDING_BATCH_SIZE = 50  # Gemini API 임베딩 요청 시 배치 크기
     FAISS_ADD_BATCH_SIZE = 100  # FAISS 인덱스에 문서 추가 시 배치 크기
-    MAX_RETRIES = 10  # API 호출 최대 재시도 횟수
+    MAX_RETRIES = 5  # API 호출 최대 재시도 횟수
     EMBEDDING_DIMENSION = 768  # 임베딩 벡터 차원 설정
 
     # API 오류별 대기 시간 설정 (초 단위)
