@@ -76,12 +76,70 @@ class RepositoryService:
             self.repository_status[repo_name] = initial_status_info
             return initial_status_info
 
+    def _update_indexing_status(self, repo_name, status, message):
+        """인덱싱 상태 업데이트"""
+        with self._status_lock:
+            self.repository_status[repo_name].update(
+                {
+                    "status": status,
+                    "progress_message": message,
+                    "last_updated_time": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    def _handle_indexing_success(self, repo_name, vector_stores):
+        """인덱싱 성공 처리"""
+        completed_time_iso = datetime.now(timezone.utc).isoformat()
+        with self._status_lock:
+            self.repository_status[repo_name].update(
+                {
+                    "status": "completed",
+                    "end_time": completed_time_iso,
+                    "last_updated_time": completed_time_iso,
+                    "code_index_status": (
+                        "completed"
+                        if vector_stores.get("code")
+                        else "not_applicable_or_failed"
+                    ),
+                    "document_index_status": (
+                        "completed"
+                        if vector_stores.get("document")
+                        else "not_applicable_or_failed"
+                    ),
+                    "progress_message": "인덱싱 완료되었습니다.",
+                }
+            )
+
+    def _handle_indexing_error(self, repo_name, e):
+        """인덱싱 오류 처리"""
+        if isinstance(e, RepositorySizeError):
+            error_msg = f"저장소 크기 초과: {str(e)}"
+            error_code = "REPO_SIZE_EXCEEDED"
+        elif isinstance(e, RepositoryError):
+            error_msg = f"인덱싱 실패: {str(e)}"
+            error_code = "REPOSITORY_ERROR"
+        elif isinstance(e, EmbeddingError):
+            error_msg = f"인덱싱 실패: {str(e)}"
+            error_code = "EMBEDDING_ERROR"
+        elif isinstance(e, IndexingError):
+            error_msg = f"인덱싱 실패: {str(e)}"
+            error_code = "INDEXING_FAILED"
+        else:
+            error_msg = f"인덱싱 중 예상치 못한 오류: {str(e)}"
+            error_code = "UNEXPECTED_INDEXING_ERROR"
+            logger.error(f"인덱싱 중 예상치 못한 오류: {e}", exc_info=True)
+
+        with self._status_lock:
+            self._update_error_status(repo_name, error_msg, error_code)
+
+        raise ServiceError(error_msg, error_code=error_code) from e
+
     def perform_indexing(self, repo_url):
         """실제 인덱싱 작업 수행 (백그라운드 실행용)."""
         repo_name = self._get_repo_name_from_url(repo_url)
         local_repo_path = self._get_local_repo_path(repo_name)
 
-        # 초기 상태 확인 (Lock 내부에서)
+        # 초기 상태 확인
         with self._status_lock:
             if (
                 repo_name not in self.repository_status
@@ -94,14 +152,9 @@ class RepositoryService:
 
         try:
             logger.info(f"저장소 인덱싱 실제 작업 시작: {repo_url}")
-            with self._status_lock:  # Lock으로 보호
-                self.repository_status[repo_name].update(
-                    {
-                        "status": "indexing",
-                        "progress_message": "저장소 정보 확인 중...",
-                        "last_updated_time": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+            self._update_indexing_status(
+                repo_name, "indexing", "저장소 정보 확인 중..."
+            )
 
             vector_stores = create_index_from_repo(
                 repo_url=repo_url,
@@ -109,58 +162,33 @@ class RepositoryService:
                 embedding_model_name=Config.DEFAULT_EMBEDDING_MODEL,
             )
 
-            completed_time_iso = datetime.now(timezone.utc).isoformat()
-            with self._status_lock:  # Lock으로 보호
-                self.repository_status[repo_name].update(
-                    {
-                        "status": "completed",
-                        "end_time": completed_time_iso,
-                        "last_updated_time": completed_time_iso,
-                        "code_index_status": (
-                            "completed"
-                            if vector_stores.get("code")
-                            else "not_applicable_or_failed"
-                        ),
-                        "document_index_status": (
-                            "completed"
-                            if vector_stores.get("document")
-                            else "not_applicable_or_failed"
-                        ),
-                        "progress_message": "인덱싱 완료되었습니다.",
-                    }
-                )
-                logger.info(f"저장소 인덱싱 완료: {repo_url}")
+            self._handle_indexing_success(repo_name, vector_stores)
+            logger.info(f"저장소 인덱싱 완료: {repo_url}")
 
-        except RepositorySizeError as e:
-            error_msg = f"저장소 크기 초과: {str(e)}"
-            with self._status_lock:  # Lock으로 보호
-                self._update_error_status(repo_name, error_msg, "REPO_SIZE_EXCEEDED")
-            # 이 예외는 API 컨트롤러로 전달되어 처리됨
-            raise ServiceError(error_msg, error_code="REPO_SIZE_EXCEEDED") from e
-        except (RepositoryError, IndexingError, EmbeddingError) as e:
-            error_msg = f"인덱싱 실패: {str(e)}"
-            specific_error_code = "INDEXING_FAILED"
-            if isinstance(e, RepositoryError):
-                specific_error_code = "REPOSITORY_ERROR"
-            elif isinstance(e, EmbeddingError):
-                specific_error_code = "EMBEDDING_ERROR"
-            with self._status_lock:  # Lock으로 보호
-                self._update_error_status(repo_name, error_msg, specific_error_code)
-            raise ServiceError(error_msg, error_code=specific_error_code) from e
         except Exception as e:
-            error_msg = f"인덱싱 중 예상치 못한 오류: {str(e)}"
-            with self._status_lock:  # Lock으로 보호
-                self._update_error_status(
-                    repo_name, error_msg, "UNEXPECTED_INDEXING_ERROR"
-                )
-            logger.error(f"인덱싱 중 예상치 못한 오류 ({repo_url}): {e}", exc_info=True)
-            raise ServiceError(error_msg, error_code="UNEXPECTED_INDEXING_ERROR") from e
+            self._handle_indexing_error(repo_name, e)
 
-    def search_repository(
-        self, repo_url, query, search_type="code"
-    ):  # 파라미터를 repo_url로 명확히 함
+    def _load_vector_store(self, repo_name, search_type):
+        """벡터 저장소 로드"""
+        embeddings = GeminiAPIEmbeddings(
+            model_name=Config.DEFAULT_EMBEDDING_MODEL,
+            document_task_type="RETRIEVAL_DOCUMENT",
+            query_task_type="RETRIEVAL_QUERY",
+        )
+
+        index_path = self._get_index_path(repo_name, search_type)
+        vector_store = load_faiss_index(index_path, embeddings, search_type)
+
+        if not vector_store:
+            raise ServiceError(
+                f"'{repo_name}' 저장소의 {search_type} 인덱스 로드에 실패했습니다.",
+                error_code="INDEX_LOAD_FAILED",
+            )
+
+        return vector_store
+
+    def search_repository(self, repo_url, query, search_type="code"):
         """저장소 검색 서비스 로직"""
-        # repo_url에서 repo_name 추출
         repo_name = self._get_repo_name_from_url(repo_url)
 
         # 인덱스 존재 여부 확인
@@ -175,24 +203,8 @@ class RepositoryService:
                 f"검색 시작: 저장소 '{repo_name}', 질의: '{query}', 타입: {search_type}"
             )
 
-            # 임베딩 모델 초기화
-            embeddings = GeminiAPIEmbeddings(
-                model_name=Config.DEFAULT_EMBEDDING_MODEL,
-                document_task_type="RETRIEVAL_DOCUMENT",
-                query_task_type="RETRIEVAL_QUERY",
-            )
-
-            # 인덱스 경로 설정
-            index_path = self._get_index_path(repo_name, search_type)
-
-            vector_store = load_faiss_index(index_path, embeddings, search_type)
-
-            if not vector_store:
-                raise ServiceError(
-                    f"'{repo_name}' 저장소의 {search_type} 인덱스 로드에 실패했습니다.",
-                    error_code="INDEX_LOAD_FAILED",
-                )
-
+            # 벡터 저장소 로드
+            vector_store = self._load_vector_store(repo_name, search_type)
             vector_stores = {search_type: vector_store}
 
             # 검색 및 RAG 수행
@@ -223,7 +235,7 @@ class RepositoryService:
             raise ServiceError(error_msg) from e
         except Exception as e:
             error_msg = f"검색 중 예상치 못한 오류: {str(e)}"
-            logger.error(error_msg, exc_info=True)  # exc_info=True 추가
+            logger.error(error_msg, exc_info=True)
             raise ServiceError(error_msg, error_code="UNEXPECTED_SEARCH_ERROR") from e
 
     def get_repository_status(self, repo_name):

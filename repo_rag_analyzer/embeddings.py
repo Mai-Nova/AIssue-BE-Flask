@@ -50,74 +50,48 @@ class GeminiAPIEmbeddings(Embeddings):
             )
             return Config.GENERAL_API_ERROR_SLEEP_TIME
 
-    def _process_batch_with_client(
-        self, client, batch_texts, batch_start_idx, batch_num, total_batches
+    def _execute_embedding_request(self, client, batch_texts):
+        """단일 임베딩 요청 실행"""
+        result = client.models.embed_content(
+            model=self.model_name,
+            contents=batch_texts,
+            config=types.EmbedContentConfig(
+                output_dimensionality=Config.EMBEDDING_DIMENSION
+            ),
+        )
+        return [emb.values for emb in result.embeddings]
+
+    def _handle_batch_success(
+        self, embeddings, batch_start_idx, batch_num, total_batches
     ):
-        """개별 클라이언트로 배치 처리"""
-        retries_count = 0
+        """배치 처리 성공 시 처리"""
+        success_indices = list(
+            range(batch_start_idx, batch_start_idx + len(embeddings))
+        )
 
-        while retries_count < self.max_retries:
-            try:
-                result = client.models.embed_content(
-                    model=self.model_name,
-                    contents=batch_texts,
-                    config=types.EmbedContentConfig(
-                        output_dimensionality=Config.EMBEDDING_DIMENSION
-                    ),
-                )
-                # 성공한 임베딩과 인덱스 정보 반환
-                embeddings = [emb.values for emb in result.embeddings]
-                success_indices = list(
-                    range(batch_start_idx, batch_start_idx + len(batch_texts))
+        with self.lock:
+            logger.debug(f"배치 {batch_num} 임베딩 성공 ({len(embeddings)}개)")
+            if batch_num < total_batches:
+                logger.info(
+                    f"성공적인 임베딩 후 {Config.SUCCESS_SLEEP_TIME}초 대기합니다."
                 )
 
-                with self.lock:
-                    logger.debug(f"배치 {batch_num} 임베딩 성공 ({len(embeddings)}개)")
-                    # 마지막 배치가 아닌 경우에만 대기 메시지 출력
-                    if batch_num < total_batches:
-                        logger.info(
-                            f"성공적인 임베딩 후 {Config.SUCCESS_SLEEP_TIME}초 대기합니다."
-                        )
+        # 마지막 배치가 아닌 경우에만 대기
+        if batch_num < total_batches:
+            time.sleep(Config.SUCCESS_SLEEP_TIME)
 
-                # 마지막 배치가 아닌 경우에만 대기
-                if batch_num < total_batches:
-                    time.sleep(Config.SUCCESS_SLEEP_TIME)
+        return {
+            "success": True,
+            "embeddings": embeddings,
+            "indices": success_indices,
+            "batch_num": batch_num,
+        }
 
-                return {
-                    "success": True,
-                    "embeddings": embeddings,
-                    "indices": success_indices,
-                    "batch_num": batch_num,
-                }
+    def _handle_batch_failure(self, batch_start_idx, batch_texts, batch_num):
+        """배치 처리 실패 시 처리"""
+        with self.lock:
+            logger.error(f"배치 {batch_num} 임베딩 최종 실패 (최대 재시도 도달)")
 
-            except Exception as e:
-                retries_count += 1
-                with self.lock:
-                    logger.warning(
-                        f"배치 {batch_num} 오류 (시도 {retries_count}/{self.max_retries}): {e}"
-                    )
-
-                is_quota_error = "429" in str(e)
-                if retries_count < self.max_retries:
-                    sleep_time = self._calculate_sleep_time(is_quota_error)
-                    time.sleep(sleep_time)
-                else:
-                    with self.lock:
-                        logger.error(
-                            f"배치 {batch_num} 임베딩 최종 실패 (최대 재시도 도달)"
-                        )
-
-                    # 실패한 인덱스 정보 반환
-                    failed_indices = list(
-                        range(batch_start_idx, batch_start_idx + len(batch_texts))
-                    )
-                    return {
-                        "success": False,
-                        "failed_indices": failed_indices,
-                        "batch_num": batch_num,
-                    }
-
-        # 이론상 도달 불가
         failed_indices = list(
             range(batch_start_idx, batch_start_idx + len(batch_texts))
         )
@@ -127,14 +101,74 @@ class GeminiAPIEmbeddings(Embeddings):
             "batch_num": batch_num,
         }
 
+    def _process_batch_with_client(
+        self, client, batch_texts, batch_start_idx, batch_num, total_batches
+    ):
+        """개별 클라이언트로 배치 처리"""
+        retries_count = 0
+
+        while retries_count < self.max_retries:
+            try:
+                embeddings = self._execute_embedding_request(client, batch_texts)
+                return self._handle_batch_success(
+                    embeddings, batch_start_idx, batch_num, total_batches
+                )
+
+            except Exception as e:
+                retries_count += 1
+                with self.lock:
+                    logger.warning(
+                        f"배치 {batch_num} 오류 (시도 {retries_count}/{self.max_retries}): {e}"
+                    )
+
+                if retries_count < self.max_retries:
+                    is_quota_error = "429" in str(e)
+                    sleep_time = self._calculate_sleep_time(is_quota_error)
+                    time.sleep(sleep_time)
+                else:
+                    return self._handle_batch_failure(
+                        batch_start_idx, batch_texts, batch_num
+                    )
+
+        return self._handle_batch_failure(batch_start_idx, batch_texts, batch_num)
+
+    def _collect_parallel_results(self, futures, total_texts):
+        """병렬 처리 결과 수집"""
+        successful_embeddings = [None] * total_texts
+        failed_original_indices = []
+        successful_count = 0
+        failed_count = 0
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+
+                if result["success"]:
+                    # 성공한 임베딩을 원본 위치에 저장
+                    for i, embedding in enumerate(result["embeddings"]):
+                        original_idx = result["indices"][i]
+                        successful_embeddings[original_idx] = embedding
+                    successful_count += len(result["embeddings"])
+                else:
+                    # 실패한 인덱스 기록
+                    failed_original_indices.extend(result["failed_indices"])
+                    failed_count += len(result["failed_indices"])
+
+            except Exception as e:
+                logger.error(f"병렬 처리 중 예기치 않은 오류: {e}")
+
+        return (
+            successful_embeddings,
+            failed_original_indices,
+            successful_count,
+            failed_count,
+        )
+
     def embed_documents(self, texts):
         """다수 문서 임베딩 (병렬 처리)"""
         if not texts:
             logger.info("빈 문서 리스트입니다.")
             return [], []
-
-        successful_embeddings = [None] * len(texts)  # 원본 순서 유지용
-        failed_original_indices = []
 
         batch_size = Config.EMBEDDING_BATCH_SIZE
         total_batches = (len(texts) + batch_size - 1) // batch_size
@@ -151,10 +185,8 @@ class GeminiAPIEmbeddings(Embeddings):
                     continue
 
                 current_batch_num = batch_idx // batch_size + 1
-                # 배치를 2개 클라이언트에 번갈아 할당
                 client = self.clients[current_batch_num % 2]
 
-                # 병렬 작업 제출 (total_batches 전달)
                 future = executor.submit(
                     self._process_batch_with_client,
                     client,
@@ -166,26 +198,12 @@ class GeminiAPIEmbeddings(Embeddings):
                 futures.append(future)
 
             # 결과 수집
-            successful_count = 0
-            failed_count = 0
-
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-
-                    if result["success"]:
-                        # 성공한 임베딩을 원본 위치에 저장
-                        for i, embedding in enumerate(result["embeddings"]):
-                            original_idx = result["indices"][i]
-                            successful_embeddings[original_idx] = embedding
-                        successful_count += len(result["embeddings"])
-                    else:
-                        # 실패한 인덱스 기록
-                        failed_original_indices.extend(result["failed_indices"])
-                        failed_count += len(result["failed_indices"])
-
-                except Exception as e:
-                    logger.error(f"병렬 처리 중 예기치 않은 오류: {e}")
+            (
+                successful_embeddings,
+                failed_original_indices,
+                successful_count,
+                failed_count,
+            ) = self._collect_parallel_results(futures, len(texts))
 
         # None 값 제거 및 최종 결과 생성
         final_embeddings = [emb for emb in successful_embeddings if emb is not None]

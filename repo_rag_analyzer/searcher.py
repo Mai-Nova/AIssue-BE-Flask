@@ -60,6 +60,85 @@ def translate_to_english(korean_text, llm_model_name):
         return korean_text
 
 
+def _perform_similarity_search(
+    vector_store, english_query, target_index, top_k, similarity_threshold
+):
+    """유사도 검색 수행 및 결과 필터링"""
+    search_results_with_scores = vector_store.similarity_search_with_score(
+        english_query, k=top_k
+    )
+
+    # 유사도 임계값으로 필터링 (코드 검색의 경우 더 관대한 임계값 적용)
+    adjusted_threshold = (
+        similarity_threshold * 0.8 if target_index == "code" else similarity_threshold
+    )
+    filtered_results = [
+        (doc, score)
+        for doc, score in search_results_with_scores
+        if score <= (1 - adjusted_threshold)  # FAISS 거리 점수를 유사도로 변환
+    ]
+
+    logger.info(
+        f"\n검색 결과 (총 {len(search_results_with_scores)}개 중 {len(filtered_results)}개가 임계값 통과, 조정된 임계값: {adjusted_threshold:.2f}):"
+    )
+
+    if not filtered_results:
+        logger.info("유사도 임계값을 만족하는 검색 결과가 없습니다.")
+        return None
+
+    for i, (doc, score) in enumerate(filtered_results):
+        similarity_percent = (1 - score) * 100  # 거리 점수를 유사도(%)로 변환
+        logger.info(
+            f"  {i+1}. 유사도: {similarity_percent:.1f}%, 소스: {doc.metadata.get('source', '알 수 없음')}, 내용 (일부): {doc.page_content[:100]}..."
+        )
+
+    return filtered_results
+
+
+def _create_rag_prompt(target_index, context_for_rag, search_query):
+    """타입별 RAG 프롬프트 생성"""
+    if target_index == "code":
+        return f"""
+        주어진 코드 컨텍스트를 바탕으로 다음 질문에 대해 한국어로 상세히 답변해 주세요.
+        코드 예제가 있다면 포함하고, 함수나 클래스의 사용법을 설명해 주세요.
+        만약 컨텍스트에 질문과 관련된 코드가 없다면, "컨텍스트에 관련 코드가 없습니다."라고 답변해 주세요.
+        
+        코드 컨텍스트:
+        {context_for_rag}
+        
+        질문: {search_query}
+        
+        답변:
+        """
+    else:
+        return f"""
+        주어진 컨텍스트 정보를 사용하여 다음 질문에 대해 한국어로 답변해 주세요.
+        만약 컨텍스트에 질문과 관련된 정보가 없다면, "컨텍스트에 관련 정보가 없습니다."라고 답변해 주세요.
+        
+        컨텍스트:
+        {context_for_rag}
+        
+        질문: {search_query}
+        
+        답변:
+        """
+
+
+def _generate_rag_response(
+    filtered_results, target_index, search_query, llm_model_name
+):
+    """RAG 응답 생성"""
+    context_for_rag = "\n\n".join([doc.page_content for doc, score in filtered_results])
+
+    prompt = _create_rag_prompt(target_index, context_for_rag, search_query)
+
+    logger.info(f"\n'{llm_model_name}' 모델을 사용하여 RAG 답변 생성을 시작합니다...")
+    response = client.models.generate_content(model=llm_model_name, contents=prompt)
+
+    logger.info("RAG 답변 생성 완료.")
+    return response.text
+
+
 def search_and_rag(
     vector_stores,
     target_index,  # "code" 또는 "document"
@@ -89,75 +168,18 @@ def search_and_rag(
     )
 
     try:
-        # 영어 질의로 유사도 점수와 함께 검색 수행
-        search_results_with_scores = vector_store.similarity_search_with_score(
-            english_query, k=top_k
-        )
-
-        # 유사도 임계값으로 필터링 (코드 검색의 경우 더 관대한 임계값 적용)
-        adjusted_threshold = (
-            similarity_threshold * 0.8
-            if target_index == "code"
-            else similarity_threshold
-        )
-        filtered_results = [
-            (doc, score)
-            for doc, score in search_results_with_scores
-            if score <= (1 - adjusted_threshold)  # FAISS 거리 점수를 유사도로 변환
-        ]
-
-        logger.info(
-            f"\n'{search_query}'에 대한 검색 결과 (총 {len(search_results_with_scores)}개 중 {len(filtered_results)}개가 임계값 통과, 조정된 임계값: {adjusted_threshold:.2f}):"
+        # 유사도 검색 수행
+        filtered_results = _perform_similarity_search(
+            vector_store, english_query, target_index, top_k, similarity_threshold
         )
 
         if not filtered_results:
-            logger.info("유사도 임계값을 만족하는 검색 결과가 없습니다.")
             return "유사도가 충분히 높은 검색 결과가 없습니다."
 
-        for i, (doc, score) in enumerate(filtered_results):
-            similarity_percent = (1 - score) * 100  # 거리 점수를 유사도(%)로 변환
-            logger.info(
-                f"  {i+1}. 유사도: {similarity_percent:.1f}%, 소스: {doc.metadata.get('source', '알 수 없음')}, 내용 (일부): {doc.page_content[:100]}..."
-            )
-
-        # RAG 프롬프트 구성 (타입별 최적화)
-        context_for_rag = "\n\n".join(
-            [doc.page_content for doc, score in filtered_results]
+        # RAG 응답 생성
+        return _generate_rag_response(
+            filtered_results, target_index, search_query, llm_model_name
         )
-
-        if target_index == "code":
-            prompt = f"""
-            주어진 코드 컨텍스트를 바탕으로 다음 질문에 대해 한국어로 상세히 답변해 주세요.
-            코드 예제가 있다면 포함하고, 함수나 클래스의 사용법을 설명해 주세요.
-            만약 컨텍스트에 질문과 관련된 코드가 없다면, "컨텍스트에 관련 코드가 없습니다."라고 답변해 주세요.
-            
-            코드 컨텍스트:
-            {context_for_rag}
-            
-            질문: {search_query}
-            
-            답변:
-            """
-        else:
-            prompt = f"""
-            주어진 컨텍스트 정보를 사용하여 다음 질문에 대해 한국어로 답변해 주세요.
-            만약 컨텍스트에 질문과 관련된 정보가 없다면, "컨텍스트에 관련 정보가 없습니다."라고 답변해 주세요.
-            
-            컨텍스트:
-            {context_for_rag}
-            
-            질문: {search_query}
-            
-            답변:
-            """
-
-        logger.info(
-            f"\n'{llm_model_name}' 모델을 사용하여 RAG 답변 생성을 시작합니다..."
-        )
-        response = client.models.generate_content(model=llm_model_name, contents=prompt)
-
-        logger.info("RAG 답변 생성 완료.")
-        return response.text
 
     except EmbeddingError as e_embed_query_fail:
         logger.error(

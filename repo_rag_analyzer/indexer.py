@@ -17,31 +17,48 @@ from common.exceptions import (
 logger = logging.getLogger(__name__)
 
 
+def _initialize_managers_and_embeddings(embedding_model_name):
+    """매니저 인스턴스 및 임베딩 모델 초기화"""
+    repo_manager = RepositoryManager()
+    doc_loader = DocumentLoader()
+    faiss_manager = FAISSManager()
+
+    embeddings = GeminiAPIEmbeddings(
+        model_name=embedding_model_name,
+        document_task_type="RETRIEVAL_DOCUMENT",
+        query_task_type="RETRIEVAL_QUERY",
+    )
+
+    return repo_manager, doc_loader, faiss_manager, embeddings
+
+
+def _setup_repository(repo_manager, repo_url, local_repo_path):
+    """저장소 정보 확인 및 복제"""
+    logger.info("--- 저장소 정보 확인 중 ---")
+    primary_language_name, _ = repo_manager.get_repository_info(
+        repo_url, Config.GITHUB_API_TOKEN
+    )
+
+    repo_manager.clone_or_load_repository(repo_url, local_repo_path)
+    repo_name_for_path = os.path.basename(local_repo_path.rstrip("/\\"))
+
+    return primary_language_name, repo_name_for_path
+
+
 def create_index_from_repo(repo_url, local_repo_path, embedding_model_name):
     """저장소 URL로부터 코드 및 문서 FAISS 인덱스를 생성합니다."""
     overall_start_time = time.time()
     vector_stores = {"code": None, "document": None}
 
-    # 매니저 인스턴스 생성
-    repo_manager = RepositoryManager()
-    doc_loader = DocumentLoader()
-    faiss_manager = FAISSManager()
-
     try:
-        # 저장소 정보 확인 및 복제
-        logger.info("--- 저장소 정보 확인 중 ---")
-        primary_language_name, _ = repo_manager.get_repository_info(
-            repo_url, Config.GITHUB_API_TOKEN
+        # 매니저 인스턴스 및 임베딩 모델 초기화
+        repo_manager, doc_loader, faiss_manager, embeddings = (
+            _initialize_managers_and_embeddings(embedding_model_name)
         )
 
-        repo_manager.clone_or_load_repository(repo_url, local_repo_path)
-        repo_name_for_path = os.path.basename(local_repo_path.rstrip("/\\"))
-
-        # 임베딩 모델 초기화
-        embeddings = GeminiAPIEmbeddings(
-            model_name=embedding_model_name,
-            document_task_type="RETRIEVAL_DOCUMENT",
-            query_task_type="RETRIEVAL_QUERY",
+        # 저장소 정보 확인 및 복제
+        primary_language_name, repo_name_for_path = _setup_repository(
+            repo_manager, repo_url, local_repo_path
         )
 
         # 코드 인덱싱
