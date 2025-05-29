@@ -1,5 +1,3 @@
-"""요청 데이터 검증 유틸리티 모듈"""
-
 import re
 from .exceptions import ValidationError
 
