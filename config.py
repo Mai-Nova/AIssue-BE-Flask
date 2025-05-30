@@ -20,7 +20,7 @@ class Config:
 
     # 디렉토리 경로
     BASE_CLONED_DIR = "./cloned_repos"
-    FAISS_INDEX_BASE_DIR = "faiss_indexes"
+    FAISS_INDEX_CODE_DIR = "faiss_indexes"
     FAISS_INDEX_DOCS_DIR = "faiss_indexes_docs"
 
     # 인덱싱 및 임베딩 설정

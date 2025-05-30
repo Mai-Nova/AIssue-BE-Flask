@@ -101,9 +101,9 @@ def _process_code_indexing(
     logger.info("--- 코드 인덱싱 시작 ---")
 
     faiss_code_index_path = os.path.join(
-        Config.FAISS_INDEX_BASE_DIR, f"{repo_name}_code"
+        Config.FAISS_INDEX_CODE_DIR, f"{repo_name}_code"
     )
-    os.makedirs(Config.FAISS_INDEX_BASE_DIR, exist_ok=True)
+    os.makedirs(Config.FAISS_INDEX_CODE_DIR, exist_ok=True)
 
     # 기존 인덱스 로드 시도
     vector_store = faiss_manager.load_index(faiss_code_index_path, embeddings, "code")
