@@ -1,11 +1,14 @@
 from flask import request, current_app
 from flask_restx import Namespace, Resource, fields
 
-from app.services.repository_context_service import repository_context_service
-from app.core.exceptions import ServiceError
+from app.services.chatbot_service import ChatbotService
+from app.core.exceptions import ServiceError, ValidationError
 
 # 네임스페이스 생성
 chatbot_ns = Namespace("chatbot", description="챗봇 관련 API")
+
+# 서비스 인스턴스 생성
+chatbot_service = ChatbotService()
 
 # 저장소 컨텍스트 기반 질문 응답 모델
 repository_context_request_model = chatbot_ns.model(
@@ -61,56 +64,28 @@ class AskRepositoryQuestion(Resource):
         """저장소 컨텍스트를 기반으로 질문에 답변"""
         try:
             data = request.get_json()
+            
+            current_app.logger.info(f"Repository context question received for repo: {data.get('repo_name')}")
 
-            repo_name = data.get("repo_name")
-            messages = data.get("messages")
-            readme_filename = data.get("readme_filename")
-            license_filename = data.get("license_filename")
-            contributing_filename = data.get("contributing_filename")
-
-            if (
-                not repo_name
-                or not messages
-                or not isinstance(messages, list)
-                or len(messages) == 0
-            ):
-                chatbot_ns.abort(
-                    400,
-                    "repo_name과 messages(배열)는 필수 항목이며, 비어있을 수 없습니다.",
-                )
-
-            # 마지막 사용자 메시지를 질문으로 사용
-            user_messages = [msg for msg in messages if msg.get("role") == "user"]
-            if not user_messages:
-                chatbot_ns.abort(400, "사용자 메시지가 필요합니다.")
-
-            # 가장 최근의 사용자 메시지를 질문으로 사용
-            question = user_messages[-1].get("content", "")
-            if not question.strip():
-                chatbot_ns.abort(400, "질문 내용이 비어있습니다.")
-
-            # 저장소 컨텍스트 기반 질문 답변
-            result = repository_context_service.answer_question_with_context(
-                repo_name=repo_name,
-                question=question,
-                readme_filename=readme_filename,
-                license_filename=license_filename,
-                contributing_filename=contributing_filename,
-                messages=messages,
-            )
-
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = chatbot_service.ask_repository_question(data)
+            
+            # 응답 상태 코드에 따라 HTTP 응답 처리
+            status_code = result.pop("status_code", 200)
+            
+            current_app.logger.info(f"Repository context question answered successfully")
+            
             return result
 
+        except ValidationError as e:
+            current_app.logger.warning(f"Chatbot request validation failed: {e}")
+            chatbot_ns.abort(400, str(e))
         except FileNotFoundError as e:
-            current_app.logger.warning(f"파일 찾기 오류 (저장소 컨텍스트 질문): {e}")
+            current_app.logger.warning(f"File not found in chatbot API: {e}")
             chatbot_ns.abort(404, str(e))
         except ServiceError as e:
-            current_app.logger.error(
-                f"서비스 오류 (저장소 컨텍스트 질문): {e}", exc_info=True
-            )
+            current_app.logger.error(f"Chatbot service error: {e}", exc_info=True)
             chatbot_ns.abort(500, str(e))
         except Exception as e:
-            current_app.logger.error(
-                f"저장소 컨텍스트 질문 답변 중 예상치 못한 오류: {e}", exc_info=True
-            )
+            current_app.logger.error(f"Unexpected error in chatbot API: {e}", exc_info=True)
             chatbot_ns.abort(500, "서버 내부 오류가 발생했습니다.")

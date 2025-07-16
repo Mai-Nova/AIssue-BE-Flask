@@ -4,19 +4,11 @@ import logging
 
 from . import api
 
-from ..services.status_service import StatusService
-from ..services.indexing_service import IndexingService
-from ..services.search_service import SearchService
-from ..services.readme_summarizer import ReadmeSummarizer
-
+from ..services.repository_service import RepositoryService
 from ..core.exceptions import ServiceError, ValidationError
 from ..core.response_utils import (
     success_response,
     error_response,
-)
-from ..core.validators import (
-    validate_repo_url,
-    validate_search_request,
 )
 
 # --- swagger_config.py 에서 가져온 모델 정의 시작 ---
@@ -212,16 +204,11 @@ progress_response = api.model(
 # api 객체는 app.api.__init__ 에서 가져온 것을 사용
 repository_ns = api.namespace("repository", description="저장소 인덱싱 및 검색 API")
 
-
 # 로거 설정
 logger = logging.getLogger(__name__)
 
 # 서비스 인스턴스 생성
-# StatusService는 싱글톤이므로 직접 인스턴스화
-status_service = StatusService()
-indexing_service = IndexingService(status_service)
-search_service = SearchService(status_service)
-readme_summarizer = ReadmeSummarizer()
+repository_service = RepositoryService()
 
 
 @repository_ns.route("/index")
@@ -237,66 +224,24 @@ class RepositoryIndex(Resource):
         data = {}
         try:
             data = request.get_json(force=True)
-            repo_url = validate_repo_url(data)
-            repository_info = data.get("repository_info", {})
             callback_url = data.get("callback_url")
             user_id = data.get("user_id")
 
-            log_payload = {
-                "repo_url": repo_url,
-                "repo_full_name": repository_info.get("fullName"),
-                "callback_url": callback_url,
-                "user_id": user_id,
-            }
             logger.info(
-                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 요청 데이터: {log_payload}"
+                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr})"
             )
 
-            if repository_info:
-                logger.debug(f"전달된 저장소 상세 정보 ({repo_url}): {repository_info}")
-
-            # 인덱싱 서비스에 콜백 URL과 사용자 ID 전달
-            initial_status_result = indexing_service.prepare_and_start_indexing(
-                repo_url, callback_url, user_id
-            )
-            repo_name = status_service._get_repo_name_from_url(repo_url)
-
-            current_status = initial_status_result.get("status")
-            is_new_request = initial_status_result.get("is_new_request", False)
-
-            # Express가 기대하는 응답 형식으로 변환
-            response_data = {
-                "analysis_id": repo_name,  # Flask에서 사용하는 분석 ID
-                "repo_name": repo_name,
-                "status": current_status,
-                "progress": initial_status_result.get("progress", 0),
-                "message": initial_status_result.get("progress_message", ""),
-                "started_at": initial_status_result.get("start_time"),
-                "estimated_completion": initial_status_result.get("end_time"),
-            }
-
-            if current_status == "completed":
-                message = (
-                    f"저장소 '{repo_name}'은(는) 이미 성공적으로 인덱싱되었습니다."
-                )
-                logger.info(
-                    f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message}"
-                )
-                return success_response(
-                    data=response_data, message=message, status_code=200
-                )
-
-            # 새로운 요청이거나 진행 중인 요청 처리
-            if is_new_request and (current_status in ["pending", "indexing"]):
-                message = f"저장소 '{repo_name}' 인덱싱 작업이 시작되었습니다."
-            else:
-                message = f"저장소 '{repo_name}' 인덱싱 작업이 이미 진행 중입니다."
-
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = repository_service.process_index_request(data, callback_url, user_id)
+            
             logger.info(
-                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 202. 메시지: {message}"
+                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: {result['status_code']}. 메시지: {result['message']}"
             )
+            
             return success_response(
-                data=response_data, message=message, status_code=202
+                data=result.get("data"), 
+                message=result["message"], 
+                status_code=result["status_code"]
             )
 
         except ValidationError as e:
@@ -306,7 +251,6 @@ class RepositoryIndex(Resource):
             logger.warning(
                 f"API 요청 유효성 검사 실패 [{request.method} {request.path}]: {error_message}. 요청 데이터: {data}"
             )
-            # logger.error(f"API 요청 오류: [{request.method}] {request.path}. 오류 메시지: '{error_message}', 코드: {error_code}, 상태 코드: {status_code}") # error_response에서 처리하도록 변경 예정
             return error_response(
                 message=error_message, error_code=error_code, status_code=status_code
             )
@@ -315,7 +259,7 @@ class RepositoryIndex(Resource):
             error_code = e.error_code or "SERVICE_ERROR"
             status_code = (
                 400 if e.error_code else 500
-            )  # ServiceError가 상태 코드를 결정할 수 있도록
+            )
             logger.error(
                 f"API 요청 처리 중 서비스 오류 발생 [{request.method} {request.path}]: {error_message}. ErrorCode: {error_code}. 요청 데이터: {data}",
                 exc_info=True,
@@ -349,37 +293,22 @@ class RepositorySearch(Resource):
         data = {}
         try:
             data = request.get_json()
-            repo_name, query, search_type = validate_search_request(data)
-
-            # search_type은 이제 항상 "code" 또는 기본값 "code"
-            if search_type != "code":
-                # 혹시 다른 값이 들어올 경우를 대비한 방어 코드 (validate_search_request에서 처리될 수도 있음)
-                logger.warning(
-                    f"지원하지 않는 search_type: {search_type}. 'code'로 강제합니다."
-                )
-                search_type = "code"
-
-            log_payload = {
-                "repo_name": repo_name,
-                "query": query,
-                "search_type": search_type,  # 항상 "code"
-            }
+            
             logger.info(
-                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 요청 데이터: {log_payload}"
+                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr})"
             )
 
-            # SearchService의 메서드 호출
-            result = search_service.search_repository(
-                f"https://github.com/{repo_name}",
-                query,
-                search_type,  # search_type은 "code"
-            )
-
-            message = "검색이 완료되었습니다."
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = repository_service.search_repository(data)
+            
             logger.info(
-                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message} (저장소: {repo_name}, 질의: '{query}')"
+                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: {result['status_code']}. 메시지: {result['message']}"
             )
-            return success_response(data=result, message=message)
+            
+            return success_response(
+                data=result["data"], 
+                message=result["message"]
+            )
 
         except ValidationError as e:
             error_message = str(e)
@@ -431,83 +360,32 @@ class RepositoryStatus(Resource):
     def get(self, repo_name):
         """저장소 인덱싱 상태 확인. Express에서 호출되는 API."""
         try:
-            log_payload = {"repo_name": repo_name}
             logger.info(
-                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 요청 데이터: {log_payload}"
+                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 저장소: {repo_name}"
             )
 
-            # StatusService의 메서드 호출
-            status_data_result = status_service.get_repository_status_data(repo_name)
-            current_status = status_data_result.get("status")
-
-            # Express가 기대하는 응답 형식으로 변환
-            response_data = {
-                "analysis_id": repo_name,
-                "repo_name": repo_name,
-                "status": current_status,
-                "progress": status_data_result.get("progress", 0),
-                "message": status_data_result.get("progress_message", ""),
-                "current_step": status_data_result.get("progress_message", ""),
-                "error": status_data_result.get("error"),
-                "error_code": status_data_result.get("error_code"),
-                "started_at": status_data_result.get("start_time"),
-                "completed_at": status_data_result.get("completion_time"),
-                "estimated_completion": status_data_result.get("estimated_completion"),
-                "eta_text": status_data_result.get("eta_text", "계산 중..."),
-            }
-
-            if current_status == "not_indexed":
-                error_message = (
-                    f"저장소 '{repo_name}'에 대한 인덱싱 정보를 찾을 수 없습니다."
-                )
-                error_code = "NOT_FOUND"
-                status_code = 404
-                logger.warning(
-                    f"API 요청 처리 중 정보 없음 [{request.method} {request.path}]: {error_message}. ErrorCode: {error_code}"
-                )
-                return error_response(
-                    message=error_message,
-                    error_code=error_code,
-                    status_code=status_code,
-                )
-            elif current_status == "failed":
-                error_message = f"저장소 '{repo_name}' 인덱싱에 실패했습니다: {status_data_result.get('error', '알 수 없는 오류')}"
-                error_code = status_data_result.get("error_code", "INDEXING_FAILED")
-                status_code = 409
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = repository_service.get_repository_status(repo_name)
+            
+            if result["status"] == "error":
                 logger.error(
-                    f"API 요청 처리 중 오류 [{request.method} {request.path}]: {error_message}. ErrorCode: {error_code}"
+                    f"API 요청 처리 중 오류 [{request.method} {request.path}]: {result['message']}. ErrorCode: {result.get('error_code')}"
                 )
                 return error_response(
-                    message=error_message,
-                    error_code=error_code,
-                    status_code=status_code,
+                    message=result["message"],
+                    error_code=result.get("error_code"),
+                    status_code=result["status_code"],
                 )
-            elif current_status in ["pending", "indexing"]:
-                message = f"저장소 '{repo_name}' 인덱싱 진행 중입니다."
-                logger.info(
-                    f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 202. 메시지: {message}"
-                )
-                return success_response(
-                    data=response_data, message=message, status_code=202
-                )
-            elif current_status == "completed":
-                message = f"저장소 '{repo_name}' 인덱싱이 완료되었습니다."
-                logger.info(
-                    f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message}"
-                )
-                return success_response(data=response_data, message=message)
-            else:  # 알 수 없는 상태
-                error_message = f"알 수 없는 상태값({current_status})입니다."
-                error_code = "UNKNOWN_STATUS"
-                status_code = 500
-                logger.error(
-                    f"API 요청 처리 중 알 수 없는 상태값 [{request.method} {request.path}]: 저장소 '{repo_name}'의 상태 '{current_status}'는 처리할 수 없습니다."
-                )
-                return error_response(
-                    message=error_message,
-                    error_code=error_code,
-                    status_code=status_code,
-                )
+            
+            logger.info(
+                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: {result['status_code']}. 메시지: {result['message']}"
+            )
+            
+            return success_response(
+                data=result.get("data"), 
+                message=result["message"], 
+                status_code=result["status_code"]
+            )
 
         except ServiceError as e:
             error_message = str(e)
@@ -640,97 +518,27 @@ class ReadmeSummary(Resource):
     @repository_ns.response(500, "서버 내부 오류", error_model)
     def post(self):
         """README 내용을 AI로 요약합니다. Express에서 호출되는 API."""
-        import asyncio  # 함수 내부에서 임포트
-
         data = {}
         try:
             data = request.get_json()
-            repo_name = data.get("repo_name")
             readme_content_length = len(data.get("readme_content", ""))
 
-            log_payload = {
-                "repo_name": repo_name,
-                "readme_content_length": readme_content_length,
-            }
             logger.info(
-                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 요청 데이터: {log_payload}"
+                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). README 길이: {readme_content_length}"
             )
 
-            if not data:
-                error_message = "요청 데이터가 필요합니다."
-                logger.warning(
-                    f"API 요청 유효성 검사 실패 [{request.method} {request.path}]: {error_message}. 요청 데이터: {data}"
-                )
-                return error_response(
-                    message=error_message, error_code="MISSING_DATA", status_code=400
-                )
-
-            readme_content = data.get("readme_content")
-
-            if not repo_name:
-                error_message = "저장소 이름이 필요합니다."
-                logger.warning(
-                    f"API 요청 유효성 검사 실패 [{request.method} {request.path}]: {error_message}. 요청 데이터: {data}"
-                )
-                return error_response(
-                    message=error_message,
-                    error_code="MISSING_REPO_NAME",
-                    status_code=400,
-                )
-
-            if not readme_content:
-                error_message = "README 내용이 필요합니다."
-                logger.warning(
-                    f"API 요청 유효성 검사 실패 [{request.method} {request.path}]: {error_message}. 요청 데이터: {data}"
-                )
-                return error_response(
-                    message=error_message,
-                    error_code="MISSING_README_CONTENT",
-                    status_code=400,
-                )
-
-            # README 요약 수행 (비동기 함수 동기 실행)
-            summary = asyncio.run(
-                readme_summarizer.summarize_readme(repo_name, readme_content)
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = repository_service.summarize_readme(data)
+            
+            logger.info(
+                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: {result['status_code']}. 메시지: {result['message']}"
             )
-
-            if summary:
-                response_data = {
-                    "repo_name": repo_name,
-                    "summary": summary,
-                    "original_length": len(readme_content),
-                    "summary_length": len(summary),
-                }
-                message = f"README 요약이 완료되었습니다: {repo_name}"
-                logger.info(
-                    f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message}"
-                )
-                return success_response(
-                    data=response_data, message=message, status_code=200
-                )
-            else:
-                fallback_description = readme_summarizer.create_fallback_description(
-                    repo_name
-                )
-                response_data = {
-                    "repo_name": repo_name,
-                    "summary": fallback_description,
-                    "original_length": len(readme_content),
-                    "summary_length": len(fallback_description),
-                    "is_fallback": True,
-                }
-                message = (
-                    f"README 요약에 실패하여 기본 설명을 생성했습니다: {repo_name}"
-                )
-                logger.warning(
-                    f"README 요약 실패, 기본 설명 사용: {repo_name}. API 응답 메시지: {message}"
-                )
-                logger.info(
-                    f"API 요청 성공 (대체 응답): [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message}"
-                )
-                return success_response(
-                    data=response_data, message=message, status_code=200
-                )
+            
+            return success_response(
+                data=result["data"], 
+                message=result["message"], 
+                status_code=result["status_code"]
+            )
 
         except ValidationError as e:
             error_message = str(e)
@@ -780,69 +588,25 @@ class Translation(Resource):
         data = {}
         try:
             data = request.get_json()
-            text = data.get("text", "").strip()
-            source_language = data.get("source_language", "auto")
-            target_language = data.get("target_language", "ko")
+            text_length = len(data.get("text", ""))
 
-            log_payload = {
-                "text_length": len(text),
-                "source_language": source_language,
-                "target_language": target_language,
-            }
             logger.info(
-                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 요청 데이터: {log_payload}"
+                f"API 요청 시작: [{request.method}] {request.path} (클라이언트 IP: {request.remote_addr}). 텍스트 길이: {text_length}"
             )
 
-            if not text:
-                error_message = "번역할 텍스트가 필요합니다."
-                error_code = "MISSING_TEXT"
-                status_code = 400
-                logger.warning(
-                    f"API 요청 유효성 검사 실패 [{request.method} {request.path}]: {error_message}. 요청 데이터: {data}"
-                )
-                return error_response(
-                    message=error_message,
-                    error_code=error_code,
-                    status_code=status_code,
-                )
-
-            # 번역 서비스 초기화 및 실행 (임포트를 try 블록 안으로 옮겨서 필요 시에만 로드)
-            from ..services.translator import Translator
-
-            translator = Translator()
-
-            translated_text = translator.translate_text(
-                text=text,
-                source_language=source_language,
-                target_language=target_language,
+            # 비즈니스 로직을 서비스 레이어로 위임
+            result = repository_service.translate_text(data)
+            
+            logger.info(
+                f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: {result['status_code']}. 메시지: {result['message']}"
+            )
+            
+            return success_response(
+                message=result["message"], 
+                data=result["data"]
             )
 
-            if translated_text:
-                response_data = {
-                    "original_text": text,
-                    "translated_text": translated_text,
-                    "source_language": source_language,  # 실제 감지된 언어 또는 제공된 언어
-                    "target_language": target_language,
-                }
-                message = "번역이 완료되었습니다."
-                logger.info(
-                    f"API 요청 성공: [{request.method}] {request.path}. 응답 코드: 200. 메시지: {message} ({len(text)}자 -> {len(translated_text)}자, {source_language} -> {target_language})"
-                )
-                return success_response(message=message, data=response_data)
-            else:
-                error_message = "번역에 실패했습니다. 원본 텍스트를 사용해주세요."
-                error_code = "TRANSLATION_FAILED"
-                status_code = 500  # 서비스 실패로 간주
-                logger.error(
-                    f"API 요청 처리 중 번역 실패 [{request.method} {request.path}]: Text length {len(text)}, Source: {source_language}, Target: {target_language}"
-                )
-                return error_response(
-                    message=error_message,
-                    error_code=error_code,
-                    status_code=status_code,
-                )
-
-        except ValidationError as e:  # 이 경우는 보통 validate_xxx 함수에서 발생
+        except ValidationError as e:
             error_message = str(e)
             error_code = "VALIDATION_ERROR"
             status_code = 400
